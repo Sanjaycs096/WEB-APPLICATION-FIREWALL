@@ -16,11 +16,27 @@ fi
 
 mkdir -p "$MODEL_DIR"
 TMP_DIR="$(mktemp -d)"
-ARCHIVE="$TMP_DIR/model.tgz"
+ARCHIVE="$TMP_DIR/model.download"
 
 curl -L "$MODEL_URL" -o "$ARCHIVE"
-tar -xzf "$ARCHIVE" -C "$TMP_DIR"
-rm -f "$ARCHIVE"
+
+FILE_SIZE=$(wc -c < "$ARCHIVE" | tr -d ' ')
+if [ "$FILE_SIZE" -lt 10240 ]; then
+  echo "Downloaded file is too small ($FILE_SIZE bytes). Check WAF_MODEL_URL." >&2
+  head -c 200 "$ARCHIVE" >&2 || true
+  exit 1
+fi
+
+if tar -tzf "$ARCHIVE" >/dev/null 2>&1; then
+  tar -xzf "$ARCHIVE" -C "$TMP_DIR"
+elif command -v unzip >/dev/null 2>&1 && unzip -t "$ARCHIVE" >/dev/null 2>&1; then
+  unzip -q "$ARCHIVE" -d "$TMP_DIR"
+else
+  # Assume direct model.pt download
+  cp "$ARCHIVE" "$MODEL_DIR/model.pt"
+  echo "Model downloaded to $MODEL_DIR/model.pt"
+  exit 0
+fi
 
 if [ -f "$TMP_DIR/model.pt" ]; then
   cp -R "$TMP_DIR/"* "$MODEL_DIR/"
