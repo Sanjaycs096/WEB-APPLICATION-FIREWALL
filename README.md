@@ -1111,45 +1111,6 @@ This project is developed as a **comprehensive academic demonstration** of Secur
 
 ---
 
-## 📜 License
-
-**Proprietary License**  
-Copyright © 2025 ISRO / Department of Space
-
-This project is developed for **academic evaluation and government use** only.
-
-**Restrictions**:
-- Commercial use prohibited without written authorization
-- Redistribution requires ISRO approval
-- Modifications must maintain security hardening
-- Attribution required in derivative works
-
-For licensing inquiries, contact: [legal@isro.gov.in](mailto:legal@isro.gov.in)
-
----
-
-## 👥 Authors & Acknowledgments
-
-**Principal Developer**  
-Senior Cybersecurity Engineer & ML Systems Architect
-
-**Academic Institution**  
-[Your University Name]  
-Department of Computer Science & Engineering  
-Secure Software Development Course (CS XXX)
-
-**Advisors**  
-- Dr. [Advisor Name], Professor of Cybersecurity
-- Dr. [Advisor Name], ML Security Research Lead
-
-**Special Thanks**  
-- ISRO Cybersecurity Team for threat modeling guidance
-- Department of Space for compliance requirements
-- OWASP Foundation for security best practices
-- Hugging Face for Transformers library
-
----
-
 ## 📊 Project Statistics
 
 ```
@@ -1209,6 +1170,3 @@ Secure Software Development Course (CS XXX)
 
 **🛡️ Built with security, academic excellence, and ❤️ for India's space infrastructure**
 
-**For ISRO / Department of Space Academic Evaluation**  
-**Secure Software Development - Final Project**  
-**January 2025**
