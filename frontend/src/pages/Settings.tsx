@@ -7,6 +7,7 @@ const API_BASE_URL = 'http://localhost:8000';
 interface SystemConfig {
   anomaly_threshold: number;
   detection_mode: 'monitor' | 'detect' | 'block';
+  protected_app_url: string;
   demo_mode: boolean;
   demo_request_count: number;
   demo_total_requests: number;
@@ -20,22 +21,36 @@ interface SystemConfig {
   enable_notifications: boolean;
 }
 
-const Settings = () => {
-  const [config, setConfig] = useState<SystemConfig>({
-    anomaly_threshold: 0.5,
-    detection_mode: 'detect',
-    demo_mode: false,
-    demo_request_count: 0,
-    demo_total_requests: 100,
+const DEFAULT_CONFIG: SystemConfig = {
+  anomaly_threshold: 0.5,
+  detection_mode: 'detect',
+  protected_app_url: '',
+  demo_mode: false,
+  demo_request_count: 0,
+  demo_total_requests: 100,
+  severity_thresholds: {
+    low: 0.3,
+    medium: 0.6,
+    high: 0.85,
+    critical: 0.95
+  },
+  logging_level: 'info',
+  enable_notifications: true
+};
+
+const normalizeConfig = (data: Partial<SystemConfig> | null | undefined): SystemConfig => {
+  return {
+    ...DEFAULT_CONFIG,
+    ...(data || {}),
     severity_thresholds: {
-      low: 0.3,
-      medium: 0.6,
-      high: 0.85,
-      critical: 0.95
-    },
-    logging_level: 'info',
-    enable_notifications: true
-  });
+      ...DEFAULT_CONFIG.severity_thresholds,
+      ...((data && data.severity_thresholds) || {})
+    }
+  };
+};
+
+const Settings = () => {
+  const [config, setConfig] = useState<SystemConfig>(DEFAULT_CONFIG);
 
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -56,7 +71,7 @@ const Settings = () => {
   const fetchConfig = async () => {
     try {
       const response = await axios.get(`${API_BASE_URL}/config`);
-      setConfig(response.data);
+      setConfig(normalizeConfig(response.data));
     } catch (error) {
       console.error('Failed to fetch config:', error);
       // Use defaults if backend not ready
@@ -109,21 +124,7 @@ const Settings = () => {
   };
 
   const handleReset = () => {
-    setConfig({
-      anomaly_threshold: 0.5,
-      detection_mode: 'detect',
-      demo_mode: false,
-      demo_request_count: 0,
-      demo_total_requests: 100,
-      severity_thresholds: {
-        low: 0.3,
-        medium: 0.6,
-        high: 0.85,
-        critical: 0.95
-      },
-      logging_level: 'info',
-      enable_notifications: true
-    });
+    setConfig(DEFAULT_CONFIG);
     setSaveMessage({ type: 'success', text: 'Configuration reset to defaults' });
     setTimeout(() => setSaveMessage(null), 3000);
   };
@@ -305,6 +306,23 @@ const Settings = () => {
         </div>
 
         <div className="space-y-6">
+          {/* Protected App URL */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Protected App URL (Origin)
+            </label>
+            <input
+              type="url"
+              placeholder="https://app.example.com or http://127.0.0.1:3000"
+              value={config.protected_app_url}
+              onChange={(e) => setConfig({ ...config, protected_app_url: e.target.value })}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+            />
+            <p className="text-sm text-gray-600 mt-2">
+              Use your application origin (the backend or static site host). This is informational and does not change routing by itself.
+            </p>
+          </div>
+
           {/* Logging Level */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">

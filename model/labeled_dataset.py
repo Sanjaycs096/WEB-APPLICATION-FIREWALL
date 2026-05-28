@@ -16,12 +16,14 @@ Author: ISRO Cybersecurity Division
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from typing import List, Dict, Optional, Tuple
 import json
+import csv
 from pathlib import Path
 from collections import Counter
 import numpy as np
+from urllib.parse import urlparse
 
 from model.classifier_model import CLASS_LABELS, LABEL_TO_CLASS
 from parsing import AccessLogParser, RequestNormalizer
@@ -84,7 +86,7 @@ class LabeledWAFDataset(Dataset):
         if self.normalize:
             try:
                 parsed = AccessLogParser.parse_http_request(item['request'])
-                normalized = self.normalizer.normalize(parsed)
+                self.normalizer.normalize(parsed)
                 text = f"{parsed['method']} {parsed['path']} {parsed.get('query', '')} {parsed.get('body', '')}"
             except Exception:
                 # If parsing fails, use raw request
@@ -256,6 +258,108 @@ def load_json_dataset(
     """
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
+
+    # Shuffle
+    np.random.shuffle(data)
+
+    # Split
+    total = len(data)
+    test_size = int(total * test_split)
+    val_size = int(total * val_split)
+    train_size = total - test_size - val_size
+
+    train_data = data[:train_size]
+    val_data = data[train_size:train_size + val_size]
+    test_data = data[train_size + val_size:]
+
+    # Create datasets
+    train_dataset = LabeledWAFDataset(train_data, tokenizer)
+    val_dataset = LabeledWAFDataset(val_data, tokenizer)
+    test_dataset = LabeledWAFDataset(test_data, tokenizer)
+
+    return train_dataset, val_dataset, test_dataset
+
+
+def load_csv_dataset(
+    csv_path: str,
+    tokenizer: WAFTokenizer,
+    test_split: float = 0.2,
+    val_split: float = 0.1
+) -> Tuple[LabeledWAFDataset, LabeledWAFDataset, LabeledWAFDataset]:
+    """
+    Load dataset from CSV file.
+
+    Expected columns:
+    - method
+    - path (preferred) or url
+    - query (optional)
+    - post_data (optional)
+    - label (benign|malicious or class label)
+
+    Args:
+        csv_path: Path to CSV dataset file
+        tokenizer: WAFTokenizer instance
+        test_split: Fraction for test set
+        val_split: Fraction for validation set
+
+    Returns:
+        Tuple of (train_dataset, val_dataset, test_dataset)
+    """
+    data: List[Dict] = []
+
+    with open(csv_path, 'r', encoding='utf-8', errors='ignore', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            method = (row.get('method') or 'GET').strip().upper()
+            path = (row.get('path') or '').strip()
+            url = (row.get('url') or '').strip()
+            query = (row.get('query') or '').strip()
+            post_data = (row.get('post_data') or '').strip()
+            raw_label = (row.get('label') or '').strip()
+
+            if not path and url:
+                try:
+                    parsed_url = urlparse(url)
+                    path = parsed_url.path or '/'
+                    if not query:
+                        query = parsed_url.query
+                except Exception:
+                    path = '/'
+
+            if not path:
+                path = '/'
+
+            # Build canonical request string for parser/tokenizer pipeline.
+            request_target = path + (f"?{query}" if query else "")
+            request_line = f"{method} {request_target} HTTP/1.1"
+            request_text = request_line + (f"\n\n{post_data}" if post_data else "")
+
+            label_upper = raw_label.upper()
+            if label_upper in LABEL_TO_CLASS:
+                label_id = LABEL_TO_CLASS[label_upper]
+            elif label_upper == 'BENIGN':
+                label_id = 0
+            elif label_upper == 'MALICIOUS':
+                # Map generic malicious labels to a specific attack class.
+                label_id = classify_attack_type(request_text)
+                if label_id == 0:
+                    label_id = 11  # UNKNOWN_ATTACK
+            else:
+                try:
+                    parsed_int = int(raw_label)
+                    label_id = parsed_int if 0 <= parsed_int < len(CLASS_LABELS) else 11
+                except (TypeError, ValueError):
+                    label_id = 11
+
+            data.append({
+                'request': request_text,
+                'label': label_id,
+                'label_name': CLASS_LABELS.get(label_id, 'UNKNOWN_ATTACK'),
+                'source': 'CSV'
+            })
+
+    if not data:
+        raise ValueError(f"No valid rows found in CSV dataset: {csv_path}")
 
     # Shuffle
     np.random.shuffle(data)

@@ -39,4 +39,4 @@ Write-Host "Press Ctrl+C to stop the server" -ForegroundColor Yellow
 Write-Host ""
 
 # Start the server
-py api/waf_api.py
+py -m api.waf_api

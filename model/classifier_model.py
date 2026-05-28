@@ -28,7 +28,7 @@ Author: ISRO Cybersecurity Division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional
 from transformers import AutoModel, AutoConfig
 from dataclasses import dataclass
 
@@ -174,7 +174,7 @@ class TransformerWAFClassifier(nn.Module):
         )
 
         # Pool: use [CLS] token representation
-        pooled_output = encoder_output.last_hidden_state[:, 0, :]  # [batch, hidden]
+        pooled_output = encoder_output.last_hidden_state[:, 0, :]
 
         # Classify
         logits = self.classifier(pooled_output)  # [batch, num_classes]
@@ -202,7 +202,11 @@ class TransformerWAFClassifier(nn.Module):
                     confidence=confidences[0].item(),
                     loss=loss,
                     hidden_states=encoder_output.last_hidden_state,
-                    attention_weights=encoder_output.attentions if hasattr(encoder_output, 'attentions') else None
+                    attention_weights=(
+                        encoder_output.attentions
+                        if hasattr(encoder_output, 'attentions')
+                        else None
+                    )
                 )
             else:
                 # Batch prediction - return dict with batch data
@@ -236,7 +240,11 @@ class TransformerWAFClassifier(nn.Module):
             output = self.forward(input_ids, attention_mask, return_dict=True)
         return output
 
-    def get_attack_severity(self, predicted_class: int, confidence: float) -> str:
+    def get_attack_severity(
+        self,
+        predicted_class: int,
+        confidence: float
+    ) -> str:
         """
         Determine attack severity.
 
@@ -251,12 +259,12 @@ class TransformerWAFClassifier(nn.Module):
             return "none"
 
         # Critical attacks
-        critical_attacks = [1, 4, 10]  # SQLi, Command Injection, Buffer Overflow
+        critical_attacks = [1, 4, 10]
         if predicted_class in critical_attacks and confidence > 0.9:
             return "critical"
 
         # High severity
-        high_attacks = [1, 2, 4, 5, 6, 10]  # SQLi, XSS, Command Inj, XXE, SSRF, Buffer
+        high_attacks = [1, 2, 4, 5, 6, 10]
         if predicted_class in high_attacks and confidence > 0.75:
             return "high"
 
@@ -297,7 +305,12 @@ class TransformerWAFClassifier(nn.Module):
         if output.attention_weights is not None and tokenizer is not None:
             tokens = tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
             # Average attention across layers and heads
-            avg_attention = output.attention_weights[-1].mean(dim=1)[0, 0].cpu().numpy()
+            avg_attention = (
+                output.attention_weights[-1]
+                .mean(dim=1)[0, 0]
+                .cpu()
+                .numpy()
+            )
 
             token_importance = [
                 {'token': tokens[i], 'importance': float(avg_attention[i])}
@@ -328,6 +341,10 @@ class TransformerWAFClassifier(nn.Module):
             num_classes=checkpoint['num_classes'],
             hidden_size=checkpoint.get('hidden_size')
         )
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        # Some training runs may persist loss function class weights.
+        # They are not part of inference architecture and should be ignored.
+        state_dict.pop('loss_fn.weight', None)
+        model.load_state_dict(state_dict, strict=False)
         model.to(device)
         return model

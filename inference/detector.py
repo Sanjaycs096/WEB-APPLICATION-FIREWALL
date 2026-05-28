@@ -17,21 +17,20 @@ Author: ISRO Cybersecurity Division
 """
 
 import torch
-import torch.nn.functional as F
 import asyncio
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 from functools import lru_cache
-import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import time
 from collections import deque
 
-from utils import get_config, WAFLogger
+from utils import WAFLogger
 from parsing import RequestNormalizer
 from tokenization import WAFTokenizer
 from model import TransformerAutoencoder
+from model.classifier_model import TransformerWAFClassifier, CLASS_LABELS
 
 
 @dataclass
@@ -39,6 +38,7 @@ class DetectionResult:
     """
     Result from anomaly detection.
     """
+
     anomaly_score: float
     is_anomalous: bool
     threshold: float
@@ -58,13 +58,14 @@ class DetectionResult:
             "perplexity": round(self.perplexity, 4),
             "normalized_request": self.normalized_request,
             "inference_time_ms": round(self.inference_time_ms, 2),
-            "metadata": self.metadata or {}
+            "metadata": self.metadata or {},
         }
 
 
 @dataclass
 class PerformanceMetrics:
     """Performance tracking for detector"""
+
     total_requests: int = 0
     anomalous_requests: int = 0
     total_inference_time_ms: float = 0.0
@@ -72,7 +73,9 @@ class PerformanceMetrics:
     cache_misses: int = 0
     recent_latencies: deque = field(default_factory=lambda: deque(maxlen=1000))
 
-    def record_request(self, latency_ms: float, is_anomalous: bool, cache_hit: bool = False):
+    def record_request(
+        self, latency_ms: float, is_anomalous: bool, cache_hit: bool = False
+    ):
         """Record a request"""
         self.total_requests += 1
         if is_anomalous:
@@ -98,12 +101,68 @@ class PerformanceMetrics:
             "total_requests": self.total_requests,
             "anomalous_requests": self.anomalous_requests,
             "benign_requests": self.total_requests - self.anomalous_requests,
-            "anomaly_rate": self.anomalous_requests / max(self.total_requests, 1),
-            "avg_latency_ms": self.total_inference_time_ms / max(self.total_requests, 1),
+            "anomaly_rate": (
+                self.anomalous_requests / max(self.total_requests, 1)
+            ),
+            "avg_latency_ms": (
+                self.total_inference_time_ms / max(self.total_requests, 1)
+            ),
             "p50_latency_ms": self.get_percentile(50),
             "p95_latency_ms": self.get_percentile(95),
             "p99_latency_ms": self.get_percentile(99),
-            "cache_hit_rate": self.cache_hits / max(self.cache_hits + self.cache_misses, 1)
+            "cache_hit_rate": (
+                self.cache_hits / max(self.cache_hits + self.cache_misses, 1)
+            ),
+        }
+
+
+@dataclass
+class FalsePositiveMetrics:
+    """Feedback-driven metrics for threshold tuning."""
+
+    feedback_samples: int = 0
+    flagged_samples: int = 0
+    false_positives: int = 0
+    true_positives: int = 0
+    true_negatives: int = 0
+    false_negatives: int = 0
+    recent_feedback: deque = field(default_factory=lambda: deque(maxlen=1000))
+
+    def record(self, predicted_anomalous: bool, actual_is_attack: bool):
+        self.feedback_samples += 1
+
+        if predicted_anomalous:
+            self.flagged_samples += 1
+
+        if predicted_anomalous and not actual_is_attack:
+            self.false_positives += 1
+            self.recent_feedback.append("fp")
+        elif predicted_anomalous and actual_is_attack:
+            self.true_positives += 1
+            self.recent_feedback.append("tp")
+        elif (not predicted_anomalous) and (not actual_is_attack):
+            self.true_negatives += 1
+            self.recent_feedback.append("tn")
+        else:
+            self.false_negatives += 1
+            self.recent_feedback.append("fn")
+
+    def to_dict(self) -> Dict:
+        precision = self.true_positives / max(self.flagged_samples, 1)
+        fp_rate = self.false_positives / max(self.flagged_samples, 1)
+        attack_samples = self.true_positives + self.false_negatives
+        fn_rate = self.false_negatives / max(attack_samples, 1)
+
+        return {
+            "feedback_samples": self.feedback_samples,
+            "flagged_samples": self.flagged_samples,
+            "false_positives": self.false_positives,
+            "true_positives": self.true_positives,
+            "true_negatives": self.true_negatives,
+            "false_negatives": self.false_negatives,
+            "precision": precision,
+            "false_positive_rate": fp_rate,
+            "false_negative_rate": fn_rate,
         }
 
 
@@ -134,7 +193,16 @@ class AnomalyDetector:
         max_workers: int = 8,
         enable_jit: bool = True,
         cache_size: int = 10000,
-        max_concurrent_batches: int = 4
+        max_concurrent_batches: int = 4,
+        enable_classifier: bool = False,
+        classifier_model_path: Optional[str] = None,
+        classifier_confidence_threshold: float = 0.75,
+        classifier_score_weight: float = 0.6,
+        auto_tune_threshold: bool = False,
+        fp_target_rate: float = 0.05,
+        fp_tuning_step: float = 0.02,
+        min_threshold: float = 0.5,
+        max_threshold: float = 0.95,
     ):
         """
         Initialize high-performance detector.
@@ -155,6 +223,16 @@ class AnomalyDetector:
         self.batch_size = batch_size
         self.enable_jit = enable_jit
         self.cache_size = cache_size
+        self.enable_classifier = enable_classifier
+        self.classifier_model_path = classifier_model_path
+        self.classifier_confidence_threshold = classifier_confidence_threshold
+        self.classifier_score_weight = classifier_score_weight
+        self.auto_tune_threshold = auto_tune_threshold
+        self.fp_target_rate = fp_target_rate
+        self.fp_tuning_step = fp_tuning_step
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
+        self.classifier_model: Optional[TransformerWAFClassifier] = None
 
         # Setup logger
         self.logger = WAFLogger(__name__)
@@ -176,6 +254,21 @@ class AnomalyDetector:
         # Load tokenizer
         self.tokenizer = WAFTokenizer.load(model_path)
 
+        # Optional supervised classifier for hybrid runtime scoring
+        if self.enable_classifier and self.classifier_model_path:
+            clf_path = Path(self.classifier_model_path)
+            if clf_path.exists():
+                self.logger.info(f"Loading classifier from: {clf_path}")
+                self.classifier_model = TransformerWAFClassifier.load_model(
+                    str(clf_path), device=device
+                )
+                self.classifier_model.eval()
+            else:
+                self.logger.warning(
+                    "Classifier model not found; running anomaly-only mode",
+                    classifier_model_path=str(clf_path),
+                )
+
         # Create normalizer
         self.normalizer = RequestNormalizer()
 
@@ -187,6 +280,7 @@ class AnomalyDetector:
 
         # Performance metrics
         self.metrics = PerformanceMetrics()
+        self.fp_metrics = FalsePositiveMetrics()
 
         # Warm up model
         self._warmup_model()
@@ -196,8 +290,40 @@ class AnomalyDetector:
             device=device,
             jit_enabled=enable_jit,
             cache_size=cache_size,
-            max_workers=max_workers
+            max_workers=max_workers,
+            classifier_enabled=self.classifier_model is not None,
         )
+
+    def _classify_from_tensors(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> Dict[str, object]:
+        """Run supervised classifier and return attack metadata."""
+        if self.classifier_model is None:
+            return {
+                "attack_probability": 0.0,
+                "attack_type": "NONE",
+                "attack_class": 0,
+                "classifier_confidence": 0.0,
+                "classifier_flag": False,
+            }
+
+        with torch.no_grad():
+            output = self.classifier_model.predict(input_ids, attention_mask)
+
+        benign_prob = float(output.probabilities[0].item())
+        attack_prob = max(0.0, min(1.0, 1.0 - benign_prob))
+        classifier_flag = (
+            output.predicted_class != 0
+            and output.confidence >= self.classifier_confidence_threshold
+        )
+
+        return {
+            "attack_probability": attack_prob,
+            "attack_type": output.predicted_label,
+            "attack_class": output.predicted_class,
+            "classifier_confidence": float(output.confidence),
+            "classifier_flag": classifier_flag,
+        }
 
     def _compile_model(self):
         """JIT compile model for faster inference"""
@@ -210,18 +336,23 @@ class AnomalyDetector:
             # Trace model
             with torch.no_grad():
                 self.model = torch.jit.trace(
-                    self.model,
-                    (dummy_input, dummy_mask, dummy_input)
+                    self.model, (dummy_input, dummy_mask, dummy_input)
                 )
 
-            self.logger.info("JIT compilation complete (2-3x speedup expected)")
+            self.logger.info(
+                "JIT compilation complete (2-3x speedup expected)"
+            )
         except Exception as e:
-            self.logger.warning(f"JIT compilation failed: {e}, falling back to eager mode")
+            self.logger.warning(
+                f"JIT compilation failed: {e}, falling back to eager mode"
+            )
 
     def _warmup_model(self):
         """Warm up model with dummy data"""
         self.logger.info("Warming up model...")
-        dummy_input = torch.randint(0, 1000, (self.batch_size, 128)).to(self.device)
+        dummy_input = torch.randint(0, 1000, (self.batch_size, 128)).to(
+            self.device
+        )
         dummy_mask = torch.ones(self.batch_size, 128).to(self.device)
 
         # Run a few warmup iterations
@@ -238,7 +369,9 @@ class AnomalyDetector:
         self.logger.info("Model warmup complete")
 
     @lru_cache(maxsize=10000)
-    def _cached_normalize(self, method: str, path: str, query_string: str) -> str:
+    def _cached_normalize(
+        self, method: str, path: str, query_string: str
+    ) -> str:
         """
         Cached normalization for common requests.
 
@@ -251,10 +384,7 @@ class AnomalyDetector:
             Normalized text
         """
         normalized = self.normalizer.normalize(
-            method=method,
-            path=path,
-            query_string=query_string,
-            headers=None
+            method=method, path=path, query_string=query_string, headers=None
         )
         return normalized.normalized_text
 
@@ -264,7 +394,7 @@ class AnomalyDetector:
         path: str,
         query_string: str = "",
         headers: Optional[Dict[str, str]] = None,
-        body: str = ""
+        body: str = "",
     ) -> DetectionResult:
         """
         Detect anomaly in a single HTTP request (async, optimized).
@@ -286,9 +416,11 @@ class AnomalyDetector:
         # Try cached normalization (fast path for common requests)
         cache_hit = False
         try:
-            normalized_text = self._cached_normalize(method, path, query_string)
+            normalized_text = self._cached_normalize(
+                method, path, query_string
+            )
             cache_hit = True
-        except:
+        except Exception:
             # Fallback to full normalization with headers
             loop = asyncio.get_event_loop()
             normalized = await loop.run_in_executor(
@@ -297,7 +429,7 @@ class AnomalyDetector:
                 method,
                 path,
                 query_string,
-                headers
+                headers,
             )
             normalized_text = normalized.normalized_text
 
@@ -307,25 +439,43 @@ class AnomalyDetector:
             self.executor,
             self.tokenizer.tokenize,
             normalized_text,
-            False  # return_original
+            False,  # return_original
         )
 
         # Move to device (zero-copy when possible)
-        input_ids = tokenized.input_ids.unsqueeze(0).to(self.device, non_blocking=True)
-        attention_mask = tokenized.attention_mask.unsqueeze(0).to(self.device, non_blocking=True)
+        input_ids = tokenized.input_ids.unsqueeze(0).to(
+            self.device, non_blocking=True
+        )
+        attention_mask = tokenized.attention_mask.unsqueeze(0).to(
+            self.device, non_blocking=True
+        )
 
         # Inference with semaphore to prevent GPU overload
         async with self.batch_semaphore:
             # Run inference in executor to not block event loop
-            anomaly_score, recon_error, perplexity = await loop.run_in_executor(
-                None,  # Use default executor for GPU work
-                self._compute_scores_optimized,
-                input_ids,
-                attention_mask
+            anomaly_score, recon_error, perplexity = (
+                await loop.run_in_executor(
+                    None,  # Use default executor for GPU work
+                    self._compute_scores_optimized,
+                    input_ids,
+                    attention_mask,
+                )
             )
 
+        # Hybrid scoring: blend anomaly + classifier attack probability
+        cls_meta = self._classify_from_tensors(input_ids, attention_mask)
+        if self.classifier_model is not None:
+            anomaly_score = (
+                1.0 - self.classifier_score_weight
+            ) * anomaly_score + self.classifier_score_weight * cls_meta[
+                "attack_probability"
+            ]
+            anomaly_score = max(0.0, min(1.0, anomaly_score))
+
         # Determine if anomalous
-        is_anomalous = anomaly_score >= self.threshold
+        is_anomalous = anomaly_score >= self.threshold or bool(
+            cls_meta.get("classifier_flag", False)
+        )
 
         # Calculate latency
         inference_time_ms = (time.perf_counter() - start_time) * 1000
@@ -344,8 +494,14 @@ class AnomalyDetector:
             metadata={
                 "original_method": method,
                 "original_path": path,
-                "cache_hit": cache_hit
-            }
+                "cache_hit": cache_hit,
+                "attack_type": cls_meta.get("attack_type", "NONE"),
+                "attack_class": cls_meta.get("attack_class", 0),
+                "classifier_confidence": cls_meta.get(
+                    "classifier_confidence", 0.0
+                ),
+                "attack_probability": cls_meta.get("attack_probability", 0.0),
+            },
         )
 
         # Log anomalies only
@@ -361,16 +517,14 @@ class AnomalyDetector:
                 metadata={
                     "reconstruction_error": recon_error,
                     "perplexity": perplexity,
-                    "latency_ms": inference_time_ms
-                }
+                    "latency_ms": inference_time_ms,
+                },
             )
 
         return result
 
     def _compute_scores_optimized(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> Tuple[float, float, float]:
         """
         Optimized score computation (runs on GPU).
@@ -385,14 +539,11 @@ class AnomalyDetector:
         with torch.no_grad():
             # Compute both metrics in single pass
             recon_error = self.model.compute_reconstruction_error(
-                input_ids,
-                attention_mask,
-                reduction="mean"
+                input_ids, attention_mask, reduction="mean"
             ).item()
 
             perplexity = self.model.compute_perplexity(
-                input_ids,
-                attention_mask
+                input_ids, attention_mask
             ).item()
 
         # Normalize scores (vectorized operations)
@@ -400,13 +551,14 @@ class AnomalyDetector:
         normalized_perplexity = min((perplexity - 1.0) / 99.0, 1.0)
 
         # Combined score (70% recon, 30% perplexity)
-        anomaly_score = 0.7 * normalized_recon_error + 0.3 * normalized_perplexity
+        anomaly_score = (
+            0.7 * normalized_recon_error + 0.3 * normalized_perplexity
+        )
 
         return anomaly_score, recon_error, perplexity
 
     async def detect_batch(
-        self,
-        requests: List[Dict[str, str]]
+        self, requests: List[Dict[str, str]]
     ) -> List[DetectionResult]:
         """
         Detect anomalies in a batch of requests (optimized for throughput).
@@ -428,9 +580,7 @@ class AnomalyDetector:
         loop = asyncio.get_event_loop()
         normalize_tasks = [
             loop.run_in_executor(
-                self.executor,
-                self._normalize_request_dict,
-                req
+                self.executor, self._normalize_request_dict, req
             )
             for req in requests
         ]
@@ -441,12 +591,16 @@ class AnomalyDetector:
             self.executor,
             self.tokenizer.tokenize_batch,
             normalized_texts,
-            self.batch_size
+            self.batch_size,
         )
 
         # Move to device with non-blocking transfer
-        input_ids = tokenized_batch["input_ids"].to(self.device, non_blocking=True)
-        attention_mask = tokenized_batch["attention_mask"].to(self.device, non_blocking=True)
+        input_ids = tokenized_batch["input_ids"].to(
+            self.device, non_blocking=True
+        )
+        attention_mask = tokenized_batch["attention_mask"].to(
+            self.device, non_blocking=True
+        )
 
         # Batch inference with semaphore
         async with self.batch_semaphore:
@@ -454,7 +608,7 @@ class AnomalyDetector:
                 None,
                 self._compute_batch_scores_optimized,
                 input_ids,
-                attention_mask
+                attention_mask,
             )
 
         # Build results
@@ -463,8 +617,17 @@ class AnomalyDetector:
         avg_latency = inference_time_ms / len(requests)
 
         for i, req in enumerate(requests):
-            anomaly_score, recon_error, perplexity = scores_list[i]
-            is_anomalous = anomaly_score >= self.threshold
+            (
+                anomaly_score,
+                recon_error,
+                perplexity,
+                attack_probability,
+                attack_type,
+                attack_class,
+                classifier_confidence,
+                classifier_flag,
+            ) = scores_list[i]
+            is_anomalous = anomaly_score >= self.threshold or classifier_flag
 
             result = DetectionResult(
                 anomaly_score=anomaly_score,
@@ -477,14 +640,20 @@ class AnomalyDetector:
                 metadata={
                     "original_method": req.get("method", ""),
                     "original_path": req.get("path", ""),
-                    "batch_size": len(requests)
-                }
+                    "batch_size": len(requests),
+                    "attack_type": attack_type,
+                    "attack_class": attack_class,
+                    "classifier_confidence": classifier_confidence,
+                    "attack_probability": attack_probability,
+                },
             )
 
             results.append(result)
 
             # Update metrics
-            self.metrics.record_request(avg_latency, is_anomalous, cache_hit=False)
+            self.metrics.record_request(
+                avg_latency, is_anomalous, cache_hit=False
+            )
 
             # Log anomalies only
             if is_anomalous:
@@ -499,8 +668,8 @@ class AnomalyDetector:
                     metadata={
                         "reconstruction_error": recon_error,
                         "perplexity": perplexity,
-                        "batch_inference": True
-                    }
+                        "batch_inference": True,
+                    },
                 )
 
         return results
@@ -519,15 +688,13 @@ class AnomalyDetector:
             method=req.get("method", ""),
             path=req.get("path", ""),
             query_string=req.get("query_string", ""),
-            headers=req.get("headers", {})
+            headers=req.get("headers", {}),
         )
         return normalized.normalized_text
 
     def _compute_batch_scores_optimized(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor
-    ) -> List[Tuple[float, float, float]]:
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> List[Tuple[float, float, float, float, str, int, float, bool]]:
         """
         Optimized batch score computation.
 
@@ -536,25 +703,50 @@ class AnomalyDetector:
             attention_mask: Batch attention masks [batch_size, seq_len]
 
         Returns:
-            List of (anomaly_score, recon_error, perplexity) tuples
+            List of tuples with anomaly and classifier metadata
         """
         with torch.no_grad():
             # Compute reconstruction errors (per sample)
             recon_errors = self.model.compute_reconstruction_error(
                 input_ids,
                 attention_mask,
-                reduction="none"  # Get per-sample errors
+                reduction="none",  # Get per-sample errors
             )
 
             # Compute perplexities (per sample)
             perplexities = self.model.compute_perplexity(
-                input_ids,
-                attention_mask
+                input_ids, attention_mask
             )
 
             # Move to CPU once
             recon_errors_cpu = recon_errors.cpu().numpy()
             perplexities_cpu = perplexities.cpu().numpy()
+
+            cls_attack_probs = None
+            cls_attack_types = None
+            cls_attack_classes = None
+            cls_confidences = None
+            cls_flags = None
+            if self.classifier_model is not None:
+                _, cls_probs, cls_pred_classes, cls_confidences_tensor, _ = (
+                    self.classifier_model(
+                        input_ids, attention_mask, return_dict=False
+                    )
+                )
+                cls_attack_probs = (1.0 - cls_probs[:, 0]).cpu().numpy()
+                cls_attack_classes = cls_pred_classes.cpu().numpy()
+                cls_confidences = cls_confidences_tensor.cpu().numpy()
+                cls_attack_types = [
+                    CLASS_LABELS[int(c)] for c in cls_attack_classes
+                ]
+                cls_flags = [
+                    bool(
+                        int(cls_attack_classes[i]) != 0
+                        and float(cls_confidences[i])
+                        >= self.classifier_confidence_threshold
+                    )
+                    for i in range(len(cls_attack_classes))
+                ]
 
         # Vectorized score computation
         results = []
@@ -566,10 +758,48 @@ class AnomalyDetector:
             normalized_recon_error = min(recon_error, 1.0)
             normalized_perplexity = min((perplexity - 1.0) / 99.0, 1.0)
 
-            # Combined score
-            anomaly_score = 0.7 * normalized_recon_error + 0.3 * normalized_perplexity
+            # Base anomaly score
+            base_score = (
+                0.7 * normalized_recon_error + 0.3 * normalized_perplexity
+            )
+            anomaly_score = base_score
 
-            results.append((anomaly_score, recon_error, perplexity))
+            if cls_attack_probs is not None:
+                anomaly_score = (
+                    1.0 - self.classifier_score_weight
+                ) * base_score + self.classifier_score_weight * float(
+                    cls_attack_probs[i]
+                )
+                anomaly_score = max(0.0, min(1.0, anomaly_score))
+
+            results.append(
+                (
+                    anomaly_score,
+                    recon_error,
+                    perplexity,
+                    (
+                        float(cls_attack_probs[i])
+                        if cls_attack_probs is not None
+                        else 0.0
+                    ),
+                    (
+                        str(cls_attack_types[i])
+                        if cls_attack_types is not None
+                        else "NONE"
+                    ),
+                    (
+                        int(cls_attack_classes[i])
+                        if cls_attack_classes is not None
+                        else 0
+                    ),
+                    (
+                        float(cls_confidences[i])
+                        if cls_confidences is not None
+                        else 0.0
+                    ),
+                    bool(cls_flags[i]) if cls_flags is not None else False,
+                )
+            )
 
         return results
 
@@ -579,7 +809,7 @@ class AnomalyDetector:
         path: str,
         query_string: str = "",
         headers: Optional[Dict[str, str]] = None,
-        body: str = ""
+        body: str = "",
     ) -> DetectionResult:
         """
         Synchronous version of detect (for non-async contexts).
@@ -607,10 +837,17 @@ class AnomalyDetector:
         """
         return {
             **self.metrics.to_dict(),
+            "false_positive_tracking": self.fp_metrics.to_dict(),
             "threshold": self.threshold,
             "device": self.device,
             "jit_enabled": self.enable_jit,
-            "cache_size": self.cache_size
+            "cache_size": self.cache_size,
+            "classifier_enabled": self.classifier_model is not None,
+            "classifier_model_path": self.classifier_model_path,
+            "classifier_confidence_threshold": (
+                self.classifier_confidence_threshold
+            ),
+            "classifier_score_weight": self.classifier_score_weight,
         }
 
     def clear_cache(self):
@@ -628,7 +865,72 @@ class AnomalyDetector:
         self.logger.info(
             f"Updating threshold: {self.threshold} -> {new_threshold}"
         )
-        self.threshold = new_threshold
+        bounded = max(
+            self.min_threshold, min(self.max_threshold, new_threshold)
+        )
+        self.threshold = bounded
+
+    def get_threshold_recommendation(self) -> Dict:
+        """Suggest threshold changes based on false-positive feedback."""
+        fp_stats = self.fp_metrics.to_dict()
+        recommended = self.threshold
+        reason = "stable"
+        should_adjust = False
+
+        if fp_stats["feedback_samples"] < 20:
+            reason = "insufficient_feedback"
+        else:
+            fp_rate = fp_stats["false_positive_rate"]
+            fn_rate = fp_stats["false_negative_rate"]
+
+            if fp_rate > self.fp_target_rate:
+                recommended = min(
+                    self.max_threshold, self.threshold + self.fp_tuning_step
+                )
+                reason = "high_false_positive_rate"
+                should_adjust = recommended != self.threshold
+            elif fn_rate > (self.fp_target_rate * 2):
+                recommended = max(
+                    self.min_threshold, self.threshold - self.fp_tuning_step
+                )
+                reason = "high_false_negative_rate"
+                should_adjust = recommended != self.threshold
+
+        return {
+            "current_threshold": self.threshold,
+            "recommended_threshold": recommended,
+            "target_false_positive_rate": self.fp_target_rate,
+            "should_adjust": should_adjust,
+            "reason": reason,
+            "false_positive_stats": fp_stats,
+        }
+
+    def record_feedback(
+        self,
+        predicted_anomalous: bool,
+        actual_is_attack: bool,
+        auto_tune: Optional[bool] = None,
+    ) -> Dict:
+        """Record labeled feedback and optionally auto-tune threshold."""
+        if auto_tune is None:
+            auto_tune = self.auto_tune_threshold
+
+        self.fp_metrics.record(predicted_anomalous, actual_is_attack)
+        recommendation = self.get_threshold_recommendation()
+
+        applied = False
+        if auto_tune and recommendation["should_adjust"]:
+            self.update_threshold(recommendation["recommended_threshold"])
+            applied = True
+
+        return {
+            "feedback_recorded": True,
+            "predicted_anomalous": predicted_anomalous,
+            "actual_is_attack": actual_is_attack,
+            "threshold": self.threshold,
+            "threshold_adjustment_applied": applied,
+            "recommendation": recommendation,
+        }
 
     def get_cache_info(self) -> Dict:
         """Get LRU cache statistics"""
@@ -638,7 +940,9 @@ class AnomalyDetector:
             "misses": cache_info.misses,
             "maxsize": cache_info.maxsize,
             "currsize": cache_info.currsize,
-            "hit_rate": cache_info.hits / max(cache_info.hits + cache_info.misses, 1)
+            "hit_rate": (
+                cache_info.hits / max(cache_info.hits + cache_info.misses, 1)
+            ),
         }
 
     def shutdown(self):
@@ -653,13 +957,12 @@ class AnomalyDetector:
         self.logger.info(
             "Detector shutdown",
             final_stats=self.get_stats(),
-            cache_info=self.get_cache_info()
+            cache_info=self.get_cache_info(),
         )
 
 
 if __name__ == "__main__":
     # Performance benchmark and demo
-    import asyncio
 
     async def benchmark():
         """Run performance benchmark"""
@@ -668,7 +971,10 @@ if __name__ == "__main__":
 
         # Note: Requires trained model
         print("To run benchmark:")
-        print("1. Train a model: python model/train.py --data-dir ./data/benign_logs")
+        print(
+            "1. Train a model: "
+            "python model/train.py --data-dir ./data/benign_logs"
+        )
         print("2. Update model_path below")
         print("3. Run: python inference/detector.py")
         print("\nExpected Performance (with CUDA):")
@@ -715,7 +1021,10 @@ results = await detector.detect_batch(requests)
 stats = detector.get_stats()
 print(f"p99 latency: {stats['p99_latency_ms']:.2f}ms")
 print(f"Cache hit rate: {stats['cache_hit_rate']*100:.1f}%")
-print(f"Throughput: {stats['total_requests']/(stats['total_inference_time_ms']/1000):.1f} RPS")
+print(
+    f"Throughput: "
+    f"{stats['total_requests']/(stats['total_inference_time_ms']/1000):.1f} RPS"
+)
 
 # Cache info
 cache_info = detector.get_cache_info()

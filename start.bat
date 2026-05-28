@@ -6,7 +6,7 @@ echo.
 
 REM Start Backend API in new window
 echo Starting Backend API Server...
-start "WAF Backend API" cmd /k "cd /d %~dp0 && set WAF_DEVICE=cpu&& py api/waf_api.py"
+start "WAF Backend API" cmd /k "cd /d %~dp0 && set WAF_DEVICE=cpu&& py -m api.waf_api"
 
 REM Wait a moment for backend to initialize
 timeout /t 3 /nobreak >nul
