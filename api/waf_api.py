@@ -627,9 +627,9 @@ async def lifespan(app: FastAPI):
         logger.warning("Initializing FallbackMockDetector due to missing model or memory constraints.")
         from inference.detector import DetectionResult
         class FallbackMockDetector:
-            async def detect(self, request: str, client_ip: str, headers: dict):
+            async def detect(self, method: str, path: str, query_string: str, headers: dict, body: str):
                 # Basic heuristic check for SQLi/XSS as fallback
-                payload = str(request).lower()
+                payload = f"{path} {query_string} {body}".lower()
                 is_anomalous = any(x in payload for x in ["select ", "union ", "script>", "alert("])
                 score = 0.99 if is_anomalous else 0.1
                 return DetectionResult(
@@ -638,9 +638,13 @@ async def lifespan(app: FastAPI):
                     threshold=0.8,
                     reconstruction_error=score,
                     perplexity=10.0,
-                    normalized_request=request[:100],
+                    normalized_request=f"{method} {path}"[:100],
                 )
             def update_threshold(self, threshold: float):
+                pass
+            def get_stats(self):
+                return {"total_requests": 0, "anomalous_requests": 0}
+            def shutdown(self):
                 pass
         detector = FallbackMockDetector()
 
