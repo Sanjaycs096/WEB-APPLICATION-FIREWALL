@@ -12,6 +12,7 @@
 ## 🎉 NEW: Complete Production-Ready System (January 2026)
 
 **✨ All Features Implemented**:
+- 🌐 **REAL WAF Gateway Proxy**: Forward or block real HTTP traffic to upstream targets!
 - 📡 **Live Traffic Monitoring**: Real-time WebSocket streaming with severity indicators
 - ⚔️ **Attack Simulation**: Test SQL Injection, XSS, Path Traversal, Command Injection
 - 📊 **Analytics Dashboard**: Historical trends, attack distribution, exportable reports
@@ -20,6 +21,7 @@
 - 🔍 **Forensic Logging**: Privacy-preserving incident logs with PII masking (SHA-256)
 - 🔄 **Continuous Learning**: Incremental model fine-tuning on benign traffic
 - 🛡️ **DevSecOps Pipeline**: Automated SAST, DAST, SCA, container security scanning
+- 🚀 **Render Deployment**: Read `docs/RENDER_DEPLOYMENT.md` for cloud instructions.
 
 **Quick Start**:
 ```bash

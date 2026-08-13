@@ -33,12 +33,15 @@ from fastapi import (
     Depends,
     WebSocket,
     WebSocketDisconnect,
+    Response,
 )
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, constr, ConfigDict
 from pydantic import ValidationError
 import asyncio
+import aiohttp
+import os
 
 try:
     from training.continuous_learning import ContinuousLearner
@@ -1588,6 +1591,16 @@ async def get_system_config():
     """
     return SYSTEM_CONFIG.model_dump()
 
+import secrets
+
+def verify_api_key(x_api_key: Optional[str]):
+    expected_key = os.environ.get("WAF_API_KEY", "")
+    if not expected_key:
+        # In production this should be required, but for tests we allow it if not set, OR we strictly require it.
+        # Actually the requirements state it MUST be required.
+        pass
+    if not x_api_key or not expected_key or not secrets.compare_digest(x_api_key, expected_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 @app.post("/config")
 async def save_config(
@@ -1603,6 +1616,7 @@ async def save_config(
     Returns:
         Saved configuration
     """
+    verify_api_key(x_api_key)
     global SYSTEM_CONFIG
 
     # Reset demo counter if demo mode is being re-enabled
@@ -1638,6 +1652,7 @@ async def reset_demo_mode(x_api_key: Optional[str] = Header(None)):
     Returns:
         Updated configuration
     """
+    verify_api_key(x_api_key)
     SYSTEM_CONFIG.demo_request_count = 0
     SYSTEM_CONFIG.demo_mode = True
 
@@ -2021,9 +2036,7 @@ async def update_threshold(
     if not detector:
         raise HTTPException(status_code=503, detail="Detector not initialized")
 
-    # Optional: Verify API key
-    # if x_api_key != os.getenv("WAF_API_KEY"):
-    #     raise HTTPException(status_code=401, detail="Unauthorized")
+    verify_api_key(x_api_key)
 
     # Validate threshold
     if not 0 <= threshold <= 1:
@@ -2117,6 +2130,109 @@ async def websocket_live_monitoring(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
     finally:
         ws_manager.disconnect(websocket)
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def waf_proxy(request: Request, path: str):
+    """
+    WAF Gateway Proxy
+    Intercepts all requests, runs ML detection, and proxies to upstream.
+    """
+    upstream_url = os.getenv("WAF_UPSTREAM_URL", SYSTEM_CONFIG.protected_app_url)
+    
+    if not upstream_url:
+        raise HTTPException(status_code=502, detail="WAF Upstream not configured (Set WAF_UPSTREAM_URL)")
+
+    max_body_bytes = int(os.getenv("WAF_MAX_BODY_BYTES", "10485760")) # Default 10MB
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > max_body_bytes:
+        return JSONResponse(status_code=413, content={"error": "Payload Too Large"})
+        
+    try:
+        body_bytes = await request.body()
+        body_str = body_bytes.decode('utf-8', errors='ignore')
+    except Exception:
+        body_str = ""
+        body_bytes = b""
+        
+    headers_dict = {}
+    hop_by_hop_in = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade'}
+    for k, v in request.headers.items():
+        if k.lower() not in ["host", "content-length"] and k.lower() not in hop_by_hop_in:
+            headers_dict[k] = v
+            
+    if detector:
+        # WAF ML Pipeline
+        result = await detector.detect(
+            method=request.method,
+            path=f"/{path}",
+            query_string=request.url.query,
+            headers=headers_dict,
+            body=body_str
+        )
+        
+        severity = determine_severity(result.anomaly_score)
+        request_data = {
+            "method": request.method,
+            "path": f"/{path}",
+            "query_string": request.url.query,
+            "headers": headers_dict,
+            "body": body_str
+        }
+        result_dict = {
+            "anomaly_score": result.anomaly_score,
+            "is_anomalous": result.is_anomalous,
+            "threshold": result.threshold,
+            "attack_type": (result.metadata or {}).get("attack_type", "NONE"),
+        }
+        
+        await emit_detection_event(request_data, result_dict)
+        
+        if result.is_anomalous:
+            if SYSTEM_CONFIG.detection_mode == "block":
+                if logger:
+                    logger.warning(f"PROXY BLOCKED: {request.method} /{path} Score: {result.anomaly_score}")
+                return JSONResponse(
+                    status_code=403, 
+                    content={"error": "Request blocked by WAF", "score": result.anomaly_score, "severity": severity}
+                )
+            elif SYSTEM_CONFIG.detection_mode == "detect":
+                if logger:
+                    logger.warning(f"PROXY ALERT: {request.method} /{path} Score: {result.anomaly_score}")
+                
+    target_url = f"{upstream_url.rstrip('/')}/{path}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+        
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.request(
+                method=request.method,
+                url=target_url,
+                headers=headers_dict,
+                data=body_bytes,
+                allow_redirects=False
+            ) as response:
+                
+                resp_headers = {}
+                hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate', 
+                              'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 'upgrade', 'content-encoding'}
+                for k, v in response.headers.items():
+                    if k.lower() not in hop_by_hop:
+                        resp_headers[k] = v
+                        
+                resp_body = await response.read()
+                return Response(
+                    content=resp_body, 
+                    status_code=response.status, 
+                    headers=resp_headers
+                )
+    except aiohttp.ClientConnectorError:
+        return JSONResponse(status_code=502, content={"error": "Bad Gateway - Upstream down"})
+    except Exception as e:
+        if logger:
+            logger.error(f"Proxy error: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": "Internal WAF Error"})
 
 
 @app.exception_handler(HTTPException)
