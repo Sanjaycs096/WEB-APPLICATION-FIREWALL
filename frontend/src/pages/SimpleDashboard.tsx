@@ -8,7 +8,8 @@ const SimpleDashboard = () => {
     setMessage('Dashboard is working!');
     
     // Test API
-    fetch('http://127.0.0.1:8000/health')
+    const baseUrl = (import.meta as any).env?.VITE_API_URL || 'http://127.0.0.1:8000';
+    fetch(`${baseUrl}/health`)
       .then(res => res.json())
       .then(data => {
         console.log('API Response:', data);

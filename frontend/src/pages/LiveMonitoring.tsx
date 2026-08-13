@@ -52,7 +52,8 @@ const LiveMonitoring = () => {
 
   const connectWebSocket = () => {
     try {
-      const ws = new WebSocket('ws://localhost:8000/ws/live');
+      const wsBaseUrl = (import.meta as any).env?.VITE_WS_URL || 'ws://localhost:8000';
+      const ws = new WebSocket(`${wsBaseUrl}/ws/live`);
       
       ws.onopen = () => {
         console.log('WebSocket connected');

@@ -81,7 +81,7 @@ const Dashboard = () => {
             Retry Connection
           </button>
           <p className="text-sm text-gray-600 mt-4">
-            Make sure the backend API is running on http://127.0.0.1:8000
+            Make sure the backend API is running on {(import.meta as any).env?.VITE_API_URL || 'http://127.0.0.1:8000'}
           </p>
         </div>
       </div>

@@ -694,12 +694,19 @@ app = FastAPI(
 )
 
 # Add security middleware
+dashboard_origin = os.getenv("WAF_DASHBOARD_ORIGIN")
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+if dashboard_origin:
+    origins.append(dashboard_origin)
+# Support common render deployment pattern implicitly if missing variable
+origins.append("https://transformer-waf.onrender.com")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
