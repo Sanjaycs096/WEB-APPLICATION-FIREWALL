@@ -8,6 +8,7 @@ tokenizers>=0.13.0
 # Web framework
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
+gunicorn>=21.0.0
 pydantic>=2.0.0
 
 # HTTP client
