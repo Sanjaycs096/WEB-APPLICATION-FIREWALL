@@ -52,7 +52,9 @@ const LiveMonitoring = () => {
 
   const connectWebSocket = () => {
     try {
-      const wsBaseUrl = (import.meta as any).env?.VITE_WS_URL || 'ws://localhost:8000';
+      const isProd = window.location.hostname === 'transformer-waf.onrender.com';
+      const defaultWsUrl = isProd ? 'wss://transformer-waf-api.onrender.com' : 'ws://localhost:8000';
+      const wsBaseUrl = (import.meta as any).env?.VITE_WS_URL || defaultWsUrl;
       const ws = new WebSocket(`${wsBaseUrl}/ws/live`);
       
       ws.onopen = () => {

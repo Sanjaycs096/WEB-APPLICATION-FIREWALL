@@ -1,7 +1,9 @@
 import axios from 'axios';
 
-// API base URL from environment or default
-const API_BASE_URL = (import.meta as any).env?.VITE_API_URL || 'http://127.0.0.1:8000';
+// API base URL from environment or intelligent default
+const isProd = window.location.hostname === 'transformer-waf.onrender.com';
+const defaultApiUrl = isProd ? 'https://transformer-waf-api.onrender.com' : 'http://127.0.0.1:8000';
+const API_BASE_URL = (import.meta as any).env?.VITE_API_URL || defaultApiUrl;
 
 const api = axios.create({
   baseURL: API_BASE_URL,

@@ -8,7 +8,9 @@ const SimpleDashboard = () => {
     setMessage('Dashboard is working!');
     
     // Test API
-    const baseUrl = (import.meta as any).env?.VITE_API_URL || 'http://127.0.0.1:8000';
+    const isProd = window.location.hostname === 'transformer-waf.onrender.com';
+    const defaultApiUrl = isProd ? 'https://transformer-waf-api.onrender.com' : 'http://127.0.0.1:8000';
+    const baseUrl = (import.meta as any).env?.VITE_API_URL || defaultApiUrl;
     fetch(`${baseUrl}/health`)
       .then(res => res.json())
       .then(data => {
